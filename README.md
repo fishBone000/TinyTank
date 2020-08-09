@@ -1,5 +1,7 @@
 # TinyTank
 A Arduino PDA worn on arm. It has RTC, OLED, 4X4 keypad and a MicroSD reader.
+![Main Menu View](https://github.com/fishBone000/TinyTank/blob/master/Pictures/MainMenu.JPG)
+More in Pictures!
 # Features
 Hardware Shell: (Under design) Makes TinyTank wearable and provides some protection from water, also provides space for Li-battery and an external power switch.
 RTC: (Under development) Using DS3231M, TinyTank displays current time at the right up corner of the OLED.
