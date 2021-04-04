@@ -1,21 +1,25 @@
 #include<Arduino.h>
+
 #include<U8g2lib.h>
 #include<Keypad.h>
+#include<DS3231.h>
+
 #include<EEPROM.h>
 
 #ifdef U8X8_HAVE_HW_SPI
 #include<SPI.h>
 #endif
-#ifdef U8X8_HAVE_HW_I2C
+//#ifdef U8X8_HAVE_HW_I2C
 #include<Wire.h>
-#endif
-#define SDExplorer 0x0
-#define Reminder 0x1
-#define Settings 0x2
-#define MainMenu 0x3
-#define KeyTestMenu 0x4
+//#endif
+#define SDExplorer 0x00
+#define Reminder 0x01
+#define Timer 0x02
+#define Settings 0x03
+#define MainMenu 0x04
+#define KeyTestMenu 0x05
 #define CritPSLoopDelay 0xC8 // 200
-#define maxIndexOfSettingsOptions 0x1
+#define maxIndexOfSettingsOptions 0x03
 
 // EEPROM Arrangement:
 // eepromHeader: (0x0000, "#TT"); TinyTank will not use settings from EEPROM unless eepromHeader is present. 
@@ -42,6 +46,35 @@ const char keyList[columnCounts*rowCounts] = {
 };
 Keypad keypad = Keypad(makeKeymap(keyList), rowPins, columnPins, rowCounts, columnCounts);
 
+class Clock:public DS3231{
+ public:
+  Clock(){}
+  byte decToBcd(byte val){
+   return  ( (val/10*16) + (val%10) );
+  }
+  byte bcdToDec(byte val){
+   return  ( (val/16*10) + (val%16) );
+  }
+
+  byte getAging(){
+   Wire.beginTransmission(0x68);
+   Wire.write(0x10);
+   Wire.endTransmission();
+
+   Wire.requestFrom(0x68, 1);
+   return bcdToDec(Wire.read());
+  }
+
+  void setAging(byte offset){
+   Wire.beginTransmission(0x68);
+   Wire.write(0x10);
+   Wire.write(decToBcd(offset));
+   Wire.endTransmission();
+  }
+};
+
+Clock clock;
+
 bool eepromCheck = false;
 bool PS = false;
 
@@ -55,6 +88,7 @@ byte m[8] = {0};
 byte currentMenu = MainMenu;
 byte PSMode = 0x1;
 byte Brightness = 0x80;
+byte Delay = 0x64;
 
 unsigned long PSTimeStamp = millis(), PSTime = 10000;
 
@@ -65,6 +99,8 @@ bool checkEepromFormat(){
 void setup(void) {
  Serial.begin(9600);
  keypad.setDebounceTime(100);
+ Wire.begin();
+
  u8g2.begin();
  u8g2.setContrast(Brightness);
  
@@ -129,6 +165,9 @@ void loop(void) {
   case Settings:
    update_Settings();
    break;
+  case Timer:
+   update_Timer();
+   break;
   default:
    update_ComingSoon();
  }
@@ -153,6 +192,9 @@ void loop(void) {
     case Settings:
      draw_Settings();
      break;
+    case Timer:
+     draw_Timer();
+     break;
     default:
      draw_ComingSoon();
      break;
@@ -168,16 +210,15 @@ void loop(void) {
  needs_draw_IME = false;
  force_draw = false;
 
- delay(100);
+ delay((unsigned int)Delay);
 }
 
 void update_topbar(){
  if(PS && PSMode == 0x2)
   return;
- if((millis() - topbar_hour*3600000 - topbar_min*60000) > 60000){
+ if(clock.getMinute() != topbar_min){
   needs_update_topbar = true;
-  topbar_hour = (unsigned long)(millis()/3600000);
-  topbar_min = (unsigned long)((millis() - topbar_hour*3600000)/60000);
+  topbar_min = clock.getMinute();
  }else
   needs_update_topbar = false;
  return;
@@ -194,18 +235,26 @@ void update_Settings(){
   m[2 + m[2]] = keyToHex();
   m[2]--;
   if(!m[2]){
-   m[2] = m[3] + m[4]*0x10;
+   m[2] = m[3] + (m[4]<<4);
    switch(m[1]){
-    case 0x0: //Brightness(Contrast)
+    case 0x00: //Brightness(Contrast)
      Brightness = m[2];
      u8g2.setContrast(Brightness);
      if(eepromCheck)
       EEPROM.update(0x0003, Brightness);
      break;
-    case 0x1: //PSMode
+    case 0x01: //PSMode
      PSMode = m[2];
      if(eepromCheck)
       EEPROM.update(0x0004, PSMode);
+     break;
+    case 0x02: //Delay
+     Delay = m[2];
+     // TODO EEPROM update code here.
+     break;
+    case 0x03: //Aging Offset
+     clock.setAging(m[2]);
+     // TODO EEPROM update code here.
      break;
    }
    m[2] = 0x0;
@@ -229,15 +278,21 @@ void update_Settings(){
    case 0x6:
     m[2] = 2;
     switch(m[1]){
-     case 0:
+     case 0x00:
       m[3] = Brightness;
       break;
-     case 1:
+     case 0x01:
       m[3] =  PSMode;
+      break;
+     case 0x02:
+      m[3] = Delay;
+      break;
+     case 0x03:
+      m[3] = clock.getAging();
       break;
     }
     m[4] = m[3] >> 4;
-    m[3] %= 0x10;
+    m[3] &= 0xF;
     break;
    case 0xA:
     changeMenuTo(MainMenu);
@@ -279,16 +334,16 @@ void update_MainMenu(){
     if(m[0])
      m[0]--;
     else
-     m[0] = 2;
+     m[0] = 0x03;
     break;
    case 0x02:
-    ++m[0] %= 3;
+    ++m[0] %= 4;
     break;
    case 0x05:
     changeMenu();
     break;
    default:
-   return;
+    return;
   }
   needs_update_menu = true;
  }
@@ -302,6 +357,81 @@ void update_ComingSoon(){
  }
  return;
 }
+
+void update_Timer(){ // TODO Optimization required.
+ // NOTE: This piece of code is for Arduino UNO ONLY. Transplanting REQUIRED before any use for other boards.
+ // 0: Input Key; 
+ // 1: Mode (0 for standby, 1 for running, 2 for paused)
+ // 2: Last second
+ // 3: Flag for whether start time stamp and pause time stamp are allocated in memory
+ // 4: 1st byte of address of array of time stamps
+ // 5: 2st byte
+ // In the array of time stamps...
+ // [0]: Shift (Used by calculating past time by millis()-Shift
+ // [1]: Pause
+ // 6: displayed second, shortened to byte, used for updating
+ // 7: current second, temporary use for updating
+ // Note that all the time stamps are stored in unsigned long
+ 
+ if(!m[3]){
+  // Ensure that memory for time stamps has been allocated 
+  // and addresses are stored
+  Serial.print("Allocating memory for time stamps...");
+  unsigned long *addr =  new unsigned long[2];
+  addr[0]=addr[1]=0;
+  (*(unsigned long **)(&m[4])) = addr;
+  m[3] = 0x1;
+  Serial.println("done");
+ }
+
+ m[0] = keypad.getKey();
+
+ if(m[0] == 0x0A){
+  Serial.print("Deleting time stamps memory...");
+  delete[] *(unsigned long **)(&m[4]);
+  Serial.println("done");
+  changeMenuTo(MainMenu);
+ }
+
+ switch(m[1]){
+  case 0: // Stanby
+   switch(m[0]){ 
+    case 0x05: // Standby, 5(Start)
+     //((unsigned long*)(((m[4] & 0xFFFF) << 8) + m[5]))[0] = millis();
+     (*(unsigned long **)(&m[4]))[0] = millis();
+     m[1] = 1;
+     needs_update_menu = true;
+     return;
+    default: // Stanby, no input
+     return;
+   }
+   break;
+
+  case 1: // Running
+   if(m[0] == 0x05){
+    (*(unsigned long **)(&m[4]))[1] = millis();
+    //((unsigned long*)(((m[4] & 0xFFFF) << 8) + m[5]))[1] = millis();
+    m[1] = 2;
+    needs_update_menu = true;
+    return;
+   }
+   m[7] = ((millis() - (*(unsigned long **)(&m[4]))[0]) / 1000) & 0xFF;
+   if(m[7] != m[6]){
+    m[6] = m[7];
+    needs_update_menu = true;
+   }
+   return;
+
+  case 2: // Paused
+   if(m[0] != 0x05)
+    return;
+   (*(unsigned long **)(&m[4]))[0] += millis() - (*(unsigned long **)(&m[4]))[1];
+   m[1] = 1;
+   return;
+ }
+}
+// (*(unsigned long *)(&m[4]))
+// ((unsigned long*)(((m[4] & 0xFFFF) << 8) + m[5]))[0]
 
 void update_KeyTestMenu(){
  // 0: int, Index of pointer.
@@ -327,8 +457,14 @@ void draw_topbar(){
  if(PS && PSMode == 0x2)
   return;
  u8g2.drawLine(0, 7, 128, 7);
+ u8g2.setCursor(0, 6);
+ u8g2.print(clock.getTemperature(), 2);
+ u8g2.print("C");
  u8g2.setCursor(112, 6);
- u8g2.print(u8x8_u8toa(topbar_hour, 2));
+ {
+  bool b = false;
+  u8g2.print(u8x8_u8toa(clock.getHour(b, b), 2));
+ }
  u8g2.print(u8x8_u8toa(topbar_min, 2));
  return;
 }
@@ -336,16 +472,17 @@ void draw_topbar(){
 void draw_MainMenu(){
  if(PS)
   return;
- u8g2.drawStr(0, 13, " SDExplorer");
- u8g2.drawStr(0, 19, " Reminder");
- u8g2.drawStr(0, 25, " Settings");
+ u8g2.drawStr(0, 13+6*SDExplorer, " SDExplorer");
+ u8g2.drawStr(0, 13+6*Reminder, " Reminder");
+ u8g2.drawStr(0, 13+6*Timer, " Timer");
+ u8g2.drawStr(0, 13+6*Settings, " Settings");
  u8g2.drawStr(0, 13+6*m[0], ">");
  return;
 }
 
 void draw_Settings(){
   //TODO Optimize code structure
- const char* options[maxIndexOfSettingsOptions+1] = {" Brightness", " PSMode"};
+ const char* options[maxIndexOfSettingsOptions+1] = {" Brightness", " PSMode", " Delay", " Aging Offset"};
  drawText(0, 13, options, maxIndexOfSettingsOptions+1);
  if(m[2]){
   u8g2.setCursor(108, 13 + 6*m[1]);
@@ -357,13 +494,26 @@ void draw_Settings(){
   u8g2.setCursor(112, 13);
   u8g2.print("0x");
   u8g2.print(Brightness>>4, HEX);
-  u8g2.print(Brightness%0x10, HEX);
+  u8g2.print(Brightness&0xF, HEX);
  }
  if(m[1] != 0x1 || !m[2]){
   u8g2.setCursor(112, 19);
   u8g2.print("0x");
   u8g2.print(PSMode>>4, HEX);
-  u8g2.print(PSMode%0x10, HEX);
+  u8g2.print(PSMode&0xF, HEX);
+ }
+ if(m[1] != 0x2 || !m[2]){
+  u8g2.setCursor(112, 25);
+  u8g2.print("0x");
+  u8g2.print(Delay>>4, HEX);
+  u8g2.print(Delay&0xF, HEX);
+ }
+ if(m[1] != 0x3 || !m[2]){
+  u8g2.setCursor(112, 31);
+  u8g2.print("0x");
+  byte Aging = clock.getAging();
+  u8g2.print(Aging>>4, HEX);
+  u8g2.print(Aging&0xF, HEX);
  }
  if(!m[2])
   u8g2.drawStr(0, 13 + 6*m[1], ">");
@@ -374,6 +524,22 @@ void draw_ComingSoon(){
  u8g2.drawStr(31, 58, "Coming Soon!");
  return;
 }
+
+void draw_Timer(){
+ unsigned long second;
+ if(!m[1])
+  second = 0;
+ else
+  second = (millis()-(*(unsigned long **)(&m[4]))[0])/1000;
+ u8g2.setCursor(62, 31);
+ u8g2.print(u8x8_u8toa(second/60, 2));
+ u8g2.print(':');
+ u8g2.print(u8x8_u8toa(second%60, 2));
+ return;
+}
+// (*(unsigned long *)(&m[4]))
+// ((unsigned long*)(((m[4] & 0xFFFF) << 8) + m[5]))[0]
+
 void draw_KeyTestMenu(){
  u8g2.setCursor(4*m[0], 13);
  Serial.println(m[0]);
@@ -407,6 +573,10 @@ void changeMenu(){
  force_draw = true;
  Serial.print("Menu changed to ");
  Serial.println(currentMenu);
+ if(currentMenu == Timer){ // Remove this part after debugging
+  update_Timer();
+  Serial.println("update_Timer called");
+ }
  return;
 }
 
